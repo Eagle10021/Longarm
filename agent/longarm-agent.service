@@ -1,0 +1,12 @@
+[Unit]
+Description=Longarm agent
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/longarm-agent
+ExecStart=/usr/bin/python3 -m longarm_agent
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
