@@ -5,6 +5,7 @@ Control your Linux computers and servers from your Android phone, over Tailscale
 Each machine runs a small agent, and the app shows only what that machine can do.
 
 - **Controls:** screen brightness for each monitor, volume and mute.
+- **Device:** lock, sleep, restart and shut down, each with its own safeguards.
 - **System:** CPU, temperature, memory, disks and uptime.
 - **Containers:** see Docker containers and restart them, with a confirmation first.
 - **Specs:** model, processor, memory, graphics, storage and network addresses.
@@ -61,6 +62,10 @@ The agent reads `~/.config/longarm/agent.json`, which is created with a new toke
 | `containers` | `true` to list Docker containers and allow restarting them. |
 | `cards_command` | A command, as a list, that prints custom cards. |
 | `ai_engines` | Local AI engines the app can switch between. |
+| `role` | `computer` or `server`. Servers have no lock or sleep, start with shutdown turned off, and need their name typed to shut down. |
+| `allow_restart`, `allow_shutdown` | Whether the app may restart or power off this machine. |
+
+The last two rows can also be changed in the app, under **Edit** for that device. They're stored and enforced on the device, so they apply to every paired phone.
 
 An AI engine is a Docker Compose stack:
 
@@ -72,6 +77,14 @@ A cards command prints JSON, and is run at most once a minute:
 
 ```json
 [{"title": "Backups", "rows": [{"label": "Photos", "value": "success", "warning": false}]}]
+```
+
+## Restart and shutdown
+
+If the app says a device needs permission, the machine is asking for a password, which is common on servers and over SSH. Run this once on that machine to allow your user to restart and shut it down:
+
+```bash
+sudo bash agent/allow-power-actions.sh
 ```
 
 ## Firewall

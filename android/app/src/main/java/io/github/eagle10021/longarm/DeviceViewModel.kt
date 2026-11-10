@@ -28,6 +28,7 @@ data class Device(
     val addresses: List<String>,
     val token: String,
     val fingerprint: String,
+    val role: String = "",
 )
 
 /** The parts of a pairing code: longarm://pair?n=name&a=host:port,host:port&t=token&f=fingerprint */
@@ -90,6 +91,7 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
                 List(addresses.length()) { addresses.getString(it) },
                 item.getString("token"),
                 item.getString("fingerprint"),
+                item.optString("role"),
             )
         }
     }
@@ -103,7 +105,8 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
                     .put("name", it.name)
                     .put("addresses", JSONArray(it.addresses))
                     .put("token", it.token)
-                    .put("fingerprint", it.fingerprint),
+                    .put("fingerprint", it.fingerprint)
+                    .put("role", it.role),
             )
         }
         prefs.edit {
@@ -208,6 +211,7 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
             addresses = pairing?.addresses ?: existing?.addresses.orEmpty(),
             token = pairing?.token ?: existing?.token.orEmpty(),
             fingerprint = pairing?.fingerprint ?: existing?.fingerprint.orEmpty(),
+            role = existing?.role.orEmpty(),
         )
         connecting = true
         error = null
@@ -253,6 +257,7 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
             if (asked === api) {
                 error = null
                 connectedAddress = asked.currentAddress
+                latest.device?.let { rememberRole(it.role) }
             }
         } catch (e: IOException) {
             if (asked === api) error = describe(e)
@@ -295,6 +300,39 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun updateKeyboard(change: (KeyboardState) -> KeyboardState) {
         state = state?.let { s -> s.copy(keyboard = s.keyboard?.let(change)) }
+    }
+
+    private fun rememberRole(role: String) {
+        val device = current?.takeIf { it.role != role } ?: return
+        val updated = device.copy(role = role)
+        current = updated
+        devices = devices.map { if (it.id == updated.id) updated else it }
+        saveDevices()
+    }
+
+    private fun updateDevice(change: (DeviceInfo) -> DeviceInfo) {
+        state = state?.let { s -> s.copy(device = s.device?.let(change)) }
+    }
+
+    /** Stored on the device, so these apply to every phone paired with it. */
+    fun setRole(role: String) {
+        updateDevice { it.copy(role = role, allowShutdown = if (role == "server") false else it.allowShutdown) }
+        rememberRole(role)
+        send("role", "/device/settings", JSONObject().put("role", role))
+    }
+
+    fun setAllowRestart(allowed: Boolean) {
+        updateDevice { it.copy(allowRestart = allowed) }
+        send("allow-restart", "/device/settings", JSONObject().put("allow_restart", allowed))
+    }
+
+    fun setAllowShutdown(allowed: Boolean) {
+        updateDevice { it.copy(allowShutdown = allowed) }
+        send("allow-shutdown", "/device/settings", JSONObject().put("allow_shutdown", allowed))
+    }
+
+    fun powerAction(action: String) {
+        send("action-$action", "/device/action", JSONObject().put("action", action))
     }
 
     fun setBrightness(screen: Screen, percent: Int) {

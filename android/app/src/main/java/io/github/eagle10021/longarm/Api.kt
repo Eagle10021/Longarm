@@ -44,6 +44,10 @@ data class SystemState(
 
 data class Container(val name: String, val running: Boolean, val status: String, val restarting: Boolean)
 
+data class DeviceCan(val lock: Boolean, val sleep: Boolean, val restart: Boolean, val shutdown: Boolean)
+
+data class DeviceInfo(val role: String, val allowRestart: Boolean, val allowShutdown: Boolean, val can: DeviceCan)
+
 data class AiEngine(val id: String, val label: String)
 
 data class AiState(val active: String?, val busy: Boolean, val engines: List<AiEngine>)
@@ -54,6 +58,7 @@ data class Card(val title: String, val rows: List<CardRow>)
 
 /** One reading from a device. A section is null or empty when that device doesn't have it. */
 data class DeviceState(
+    val device: DeviceInfo?,
     val keyboard: KeyboardState?,
     val battery: BatteryState?,
     val power: PowerState?,
@@ -152,7 +157,11 @@ class DeviceApi(private val addresses: List<String>, private val token: String, 
             if (body != null) connection.outputStream.use { it.write(body.toByteArray()) }
             val code = connection.responseCode
             if (code == 401) throw ApiException("This device rejected the token. Pair it again.")
-            if (code >= 400) throw ApiException("The device answered with error $code")
+            if (code >= 400) {
+                val reply = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                val reason = runCatching { JSONObject(reply).optString("error") }.getOrDefault("")
+                throw ApiException(reason.ifBlank { "The device answered with error $code" })
+            }
             return connection.inputStream.bufferedReader().use { it.readText() }
         } finally {
             connection.disconnect()
@@ -163,6 +172,7 @@ class DeviceApi(private val addresses: List<String>, private val token: String, 
         val volume = json.optJSONObject("volume")
         val screens = json.optJSONArray("screens") ?: JSONArray()
         return DeviceState(
+            device = json.optJSONObject("device")?.let(::parseDevice),
             keyboard = json.optJSONObject("keyboard")?.let(::parseKeyboard),
             battery = json.optJSONObject("battery")?.let(::parseBattery),
             power = if (json.has("charge_mode")) parsePower(json) else null,
@@ -181,6 +191,21 @@ class DeviceApi(private val addresses: List<String>, private val token: String, 
             },
             volumePercent = volume?.getInt("percent"),
             muted = volume?.getBoolean("muted") ?: false,
+        )
+    }
+
+    private fun parseDevice(device: JSONObject): DeviceInfo {
+        val can = device.optJSONObject("can") ?: JSONObject()
+        return DeviceInfo(
+            role = device.optString("role", "computer"),
+            allowRestart = device.optBoolean("allow_restart"),
+            allowShutdown = device.optBoolean("allow_shutdown"),
+            can = DeviceCan(
+                can.optBoolean("lock"),
+                can.optBoolean("sleep"),
+                can.optBoolean("restart"),
+                can.optBoolean("shutdown"),
+            ),
         )
     }
 

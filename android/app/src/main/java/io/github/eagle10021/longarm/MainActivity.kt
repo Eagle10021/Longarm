@@ -41,6 +41,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.NavigationDrawerItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Scaffold
@@ -177,7 +178,7 @@ private fun Menu(model: DeviceViewModel, page: Page, choose: (((Page) -> Unit) -
             style = MaterialTheme.typography.labelLarge,
         )
         model.devices.sortedBy { it.name.lowercase() }.forEach { device ->
-            MenuItem(device.name, page == Page.Main && device.id == current?.id) {
+            MenuItem(device.name, page == Page.Main && device.id == current?.id, device.role == "server") {
                 choose { show ->
                     model.select(device)
                     show(Page.Main)
@@ -194,18 +195,19 @@ private fun Menu(model: DeviceViewModel, page: Page, choose: (((Page) -> Unit) -
 }
 
 @Composable
-private fun MenuItem(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun MenuItem(label: String, selected: Boolean, server: Boolean = false, onClick: () -> Unit) {
     NavigationDrawerItem(
         label = { Text(label) },
         selected = selected,
         onClick = onClick,
+        badge = { if (server) Label("Server") },
         modifier = Modifier.padding(horizontal = 12.dp),
     )
 }
 
 @Composable
-private fun TopRow(title: String, onMenu: () -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+private fun TopRow(title: String, onMenu: () -> Unit, server: Boolean = false) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         IconButton(onMenu, Modifier.semantics { contentDescription = "Open menu" }) {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 repeat(3) {
@@ -214,6 +216,7 @@ private fun TopRow(title: String, onMenu: () -> Unit) {
             }
         }
         Text(title, Modifier.padding(start = 4.dp), style = MaterialTheme.typography.headlineSmall)
+        if (server) Label("Server")
     }
 }
 
@@ -244,7 +247,7 @@ private fun AppContent(model: DeviceViewModel, page: Page, showPage: (Page) -> U
             DeviceForm(model, page.device, onClose = toMain)
         }
         else -> {
-            TopRow(model.current?.name ?: "Longarm", onMenu)
+            TopRow(model.current?.name ?: "Longarm", onMenu, model.current?.role == "server")
             Controls(model)
         }
     }
@@ -353,6 +356,7 @@ private fun DeviceForm(model: DeviceViewModel, device: Device, onClose: () -> Un
 
     OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth(), label = { Text("Name") }, singleLine = true)
     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) { networkNames(device.addresses).forEach { Label(it) } }
+    model.state?.device?.takeIf { model.current?.id == device.id }?.let { DeviceSettings(model, it) }
     model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Button({ model.save(device, name, "", onClose) }, enabled = name.isNotBlank() && !model.connecting) {
@@ -376,6 +380,93 @@ private fun DeviceForm(model: DeviceViewModel, device: Device, onClose: () -> Un
             dismissButton = { TextButton({ confirmRemove = false }) { Text("Cancel") } },
         )
     }
+}
+
+@Composable
+private fun DeviceSettings(model: DeviceViewModel, info: DeviceInfo) {
+    Section("Device settings") {
+        Text(
+            "Saved on the device, so these apply to every phone paired with it.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Choices(listOf("computer" to "Computer", "server" to "Server"), info.role) { model.setRole(it) }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Allow restart from the app", Modifier.weight(1f))
+            Switch(info.allowRestart, { model.setAllowRestart(it) })
+        }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Allow shutdown from the app", Modifier.weight(1f))
+            Switch(info.allowShutdown, { model.setAllowShutdown(it) })
+        }
+    }
+}
+
+@Composable
+private fun DevicePower(model: DeviceViewModel, info: DeviceInfo) {
+    val name = model.current?.name ?: "this device"
+    val ask = rememberConfirmer()
+    var typedShutdown by remember { mutableStateOf(false) }
+    val server = info.role == "server"
+    val actions = buildList {
+        if (!server && info.can.lock) add("Lock" to { model.powerAction("lock") })
+        if (!server && info.can.sleep) {
+            add("Sleep" to { ask(true, "Put $name to sleep?") { model.powerAction("sleep") } })
+        }
+        if (info.allowRestart && info.can.restart) {
+            add("Restart" to { ask(true, "Restart $name?") { model.powerAction("restart") } })
+        }
+        if (info.allowShutdown && info.can.shutdown) {
+            add(
+                "Shut down" to {
+                    if (server) {
+                        typedShutdown = true
+                    } else {
+                        ask(true, "Shut down $name?") { model.powerAction("shutdown") }
+                    }
+                },
+            )
+        }
+    }
+    val blocked = (info.allowRestart && !info.can.restart) || (info.allowShutdown && !info.can.shutdown)
+    if (actions.isEmpty() && !blocked) return
+    Section("Device") {
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            actions.forEach { (label, action) -> OutlinedButton(action) { Text(label) } }
+        }
+        if (blocked) {
+            Text(
+                "This device needs permission before it can restart or shut down from the app. See the README.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+    if (typedShutdown) ServerShutdownDialog(name, { typedShutdown = false }) { model.powerAction("shutdown") }
+}
+
+/** A server may be hard to turn back on remotely, so its name has to be typed first. */
+@Composable
+private fun ServerShutdownDialog(name: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    var typed by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Shut down $name?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("This is a server, and it may be hard to turn back on remotely. Type its name to continue.")
+                OutlinedTextField(typed, { typed = it }, label = { Text(name) }, singleLine = true)
+            }
+        },
+        confirmButton = {
+            TextButton(
+                {
+                    onConfirm()
+                    onDismiss()
+                },
+                enabled = typed.trim() == name,
+            ) { Text("Shut down") }
+        },
+        dismissButton = { TextButton(onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
@@ -453,6 +544,7 @@ private fun ControlSections(model: DeviceViewModel, state: DeviceState) {
     Sound(model, state)
     state.keyboard?.let { Keyboard(model, it) }
     state.power?.let { Power(model, it) }
+    state.device?.let { DevicePower(model, it) }
 }
 
 /** Returns a function that runs an action, first asking in a dialog when the first argument is true. */

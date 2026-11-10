@@ -13,11 +13,14 @@ middle would show a different code. Only then does /pair/poll return the token.
 Every other request needs "Authorization: Bearer <token>".
     GET  /peers       other Longarm machines on this Tailscale network
     GET  /specs       label and value rows describing this machine
-    GET  /state       the sections this machine has: keyboard, battery, power, system, containers, screens, volume
+    GET  /state       the sections this machine has: device, keyboard, battery, power, system, containers, screens,
+                      volume
     POST /keyboard    any of: effect, color, colors (4), brightness (Low/High/Off), speed (1-4), profile
     POST /power       charge_mode (normal/conservation/rapid) and/or power_profile
     POST /brightness  {"screen": "display0", "percent": 50}
     POST /volume      {"percent": 40} and/or {"muted": true}
+    POST /device/action    {"action": "lock", "sleep", "restart" or "shutdown"}
+    POST /device/settings  any of: role ("computer" or "server"), allow_restart, allow_shutdown
 Further routes can be added with extra_routes.
 """
 import concurrent.futures
@@ -52,6 +55,9 @@ DISCOVERY_REQUEST = b"longarm-discover-1"
 PAIR_LIFETIME_S = 120
 PAIR_COOLDOWN_S = 5  # a phone on the network can't raise approval prompts faster than this
 PROBE_TIMEOUT_S = 1.5
+POWER_ACTION_DELAY_S = 3  # lets the reply reach the phone first
+POWER_CHECK_CACHE_S = 60
+POWER_ACTIONS = ("lock", "sleep", "restart", "shutdown")
 
 
 def ensure_certificate(directory):
@@ -120,12 +126,13 @@ def _probe(name, address, port):
 
 class PhoneAPI:
     def __init__(self, config, get_state, on_command, cert_dir, extra_routes=None, on_pair_request=None,
-                 extra_state=None):
+                 extra_state=None, save_config=None):
         """
         get_state() returns the latest snapshot. on_command(dict) must be safe to call from any thread, and is None
         on machines without keyboard and power controls. extra_routes maps a POST path to fn(body) -> (status, reply).
         on_pair_request(phone name, code) is called from a server thread when a phone asks to pair.
         extra_state() adds sections to /state, and is called on the request's own thread.
+        save_config() stores config after the phone changes the device settings kept in it.
         """
         self.config = config
         self.get_state = get_state
@@ -134,6 +141,9 @@ class PhoneAPI:
         self.extra_routes = extra_routes or {}
         self.on_pair_request = on_pair_request
         self.extra_state = extra_state
+        self.save_config = save_config
+        self._device_lock = threading.Lock()
+        self._power_checked = (-POWER_CHECK_CACHE_S, {})
         self._specs = None
         self.addresses = []
         self._pair_lock = threading.Lock()
@@ -318,12 +328,80 @@ class PhoneAPI:
     def _full_state(self):
         state = self.get_state()
         extra = self.extra_state() if self.extra_state else {}
-        return state and {**state, **extra, "screens": desktop.screens(), "volume": desktop.volume()}
+        if not state:
+            return state
+        return {**state, **extra, "device": self._device_state(), "screens": desktop.screens(),
+                "volume": desktop.volume()}
+
+    def _role(self):
+        return "server" if self.config.get("role") == "server" else "computer"
+
+    def _allows_restart(self):
+        return bool(self.config.get("allow_restart", True))
+
+    def _allows_shutdown(self):
+        """Servers start with shutdown off, since one can be hard to turn back on remotely."""
+        return bool(self.config.get("allow_shutdown", self._role() != "server"))
+
+    def _power_capabilities(self):
+        with self._device_lock:
+            checked_at, capabilities = self._power_checked
+        if time.monotonic() - checked_at > POWER_CHECK_CACHE_S:
+            capabilities = desktop.power_capabilities()
+            with self._device_lock:
+                self._power_checked = (time.monotonic(), capabilities)
+        return capabilities
+
+    def _device_state(self):
+        return {"role": self._role(), "allow_restart": self._allows_restart(),
+                "allow_shutdown": self._allows_shutdown(), "can": self._power_capabilities()}
+
+    def _update_device(self, body):
+        role, restart, shutdown = body.get("role"), body.get("allow_restart"), body.get("allow_shutdown")
+        if role not in (None, "computer", "server") or any(v is not None and not isinstance(v, bool)
+                                                           for v in (restart, shutdown)):
+            return 400, {"error": "expected role, allow_restart or allow_shutdown"}
+        if role is None and restart is None and shutdown is None:
+            return 400, {"error": "nothing to change"}
+        with self._device_lock:
+            if role == "server" and self._role() != "server" and shutdown is None:
+                shutdown = False
+            if role is not None:
+                self.config["role"] = role
+            if restart is not None:
+                self.config["allow_restart"] = restart
+            if shutdown is not None:
+                self.config["allow_shutdown"] = shutdown
+        if self.save_config:
+            self.save_config()
+        return 200, self._device_state()
+
+    def _device_action(self, body):
+        action = body.get("action")
+        if action not in POWER_ACTIONS:
+            return 400, {"error": "unknown action"}
+        if action in ("lock", "sleep") and self._role() == "server":
+            return 403, {"error": f"{action.capitalize()} isn't available on a server"}
+        if action == "restart" and not self._allows_restart():
+            return 403, {"error": "Restart is turned off for this device"}
+        if action == "shutdown" and not self._allows_shutdown():
+            return 403, {"error": "Shutdown is turned off for this device"}
+        if not self._power_capabilities().get(action):
+            return 409, {"error": f"This device doesn't allow {action} without a password"}
+        log.info("Power action from the phone: %s", action)
+        timer = threading.Timer(POWER_ACTION_DELAY_S, desktop.run_power_action, args=(action,))
+        timer.daemon = True
+        timer.start()
+        return 202, {"action": action}
 
     def _route(self, path, body):
         """(HTTP status, reply) for a POST."""
         if path in self.extra_routes:
             return self.extra_routes[path](body)
+        if path == "/device/settings":
+            return self._update_device(body)
+        if path == "/device/action":
+            return self._device_action(body)
         if path in ("/keyboard", "/power") and self.on_command:
             allowed = KEYBOARD_KEYS if path == "/keyboard" else POWER_KEYS
             command = {k: v for k, v in body.items() if k in allowed}
@@ -380,12 +458,17 @@ class PhoneAPI:
                 self._reply(200, state) if state else self._reply(503, {"error": "starting"})
 
             def do_POST(self):
+                # The body is read before any refusal: closing with it unread resets the connection, and the
+                # client would see a network failure in place of the reply
+                try:
+                    raw = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), MAX_BODY_BYTES))
+                except ValueError:
+                    return self._reply(400, {"error": "bad length"})
                 pairing = {"/pair/request": api._request_pairing, "/pair/poll": api._poll_pairing}.get(self.path)
                 if not pairing and not self._authorized():
                     return
                 try:
-                    length = min(int(self.headers.get("Content-Length", 0)), MAX_BODY_BYTES)
-                    body = json.loads(self.rfile.read(length) or b"{}")
+                    body = json.loads(raw or b"{}")
                     if not isinstance(body, dict):
                         raise ValueError("expected a JSON object")
                 except ValueError as e:

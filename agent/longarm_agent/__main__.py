@@ -12,6 +12,8 @@ Settings are in ~/.config/longarm/agent.json, created on the first run with a ne
     cards_command  a command that prints extra read-only cards as JSON (see the README)
     ai_engines     local AI Docker Compose stacks to switch between (see the README)
     listen         addresses to listen on; empty means Tailscale and the home network
+    role           "computer" or "server"; servers have no sleep or lock, and start with shutdown turned off
+    allow_restart, allow_shutdown   whether the app may restart or power off this machine
 """
 import json
 import logging
@@ -38,6 +40,12 @@ RESTART_TIMEOUT_S = 180
 ANSWER_PREFIX = "pair-answer-"  # --approve and --deny leave a file with this prefix for the running agent
 
 
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(config, f, indent=1)
+
+
 def load_config():
     """The saved settings over the defaults. Writes the file, private to this user, when it needs a new token."""
     try:
@@ -46,9 +54,7 @@ def load_config():
         config = dict(DEFAULTS)
     if not config["token"]:
         config["token"] = secrets.token_urlsafe(24)
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with os.fdopen(os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-            json.dump(config, f, indent=1)
+        save_config(config)
     return config
 
 
@@ -242,7 +248,7 @@ def main():
                      phone, code, code)
 
     extra = (lambda: {"ai": ai.state()}) if ai else None
-    api = PhoneAPI(config, state, None, str(CONFIG_DIR), routes, pair_requested, extra)
+    api = PhoneAPI(config, state, None, str(CONFIG_DIR), routes, pair_requested, extra, lambda: save_config(config))
     logging.info("Longarm agent: %s on %s", api.status, ", ".join(api.addresses) or "no address yet")
     while True:
         time.sleep(1)

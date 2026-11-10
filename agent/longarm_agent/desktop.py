@@ -192,6 +192,26 @@ class AIEngines:
         return 202, {"switching": wanted}
 
 
+def power_capabilities():
+    """Which power actions this user can run without a password prompt."""
+    def allowed(method):
+        out = _run("busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1",
+                   "org.freedesktop.login1.Manager", method)
+        return (out or "").strip() == 's "yes"'
+
+    return {"lock": _run("busctl", "--user", "status", "org.freedesktop.ScreenSaver") is not None,
+            "sleep": allowed("CanSuspend"), "restart": allowed("CanReboot"), "shutdown": allowed("CanPowerOff")}
+
+
+def run_power_action(action):
+    """Locks the screen, or suspends, restarts or powers off the machine."""
+    if action == "lock":
+        _run("busctl", "--user", "call", "org.freedesktop.ScreenSaver", "/ScreenSaver",
+             "org.freedesktop.ScreenSaver", "Lock")
+    else:
+        _run("systemctl", {"sleep": "suspend", "restart": "reboot", "shutdown": "poweroff"}[action])
+
+
 def tailscale_peers():
     """(host name, address) of the other machines currently online on this Tailscale network."""
     out = _run("tailscale", "status", "--json")
